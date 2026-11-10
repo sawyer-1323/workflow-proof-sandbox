@@ -101,7 +101,9 @@ jobs:
             --jq '.[] | [.sha, (.author.login // ""), (.committer.login // ""), (.commit.verification.verified | tostring), (.commit.verification.reason // "")] | @tsv' 2>/dev/null)" \
             || { echo "::error::cannot list the PR commits"; exit 2; }
           n="$(printf '%s\n' "$all" | grep -c . || true)"
-          [ "$n" -ge 1 ] && [ "$n" -lt 250 ] || { echo "::error::commit list empty or at the API's 250-commit limit"; exit 2; }
+          if ! { [ "$n" -ge 1 ] && [ "$n" -lt 250 ]; }; then
+            echo "::error::commit list empty or at the API's 250-commit limit"; exit 2
+          fi
           bad="$(printf '%s\n' "$all" | awk -F'\t' -v a="$APPROVER" '!($2 == a && $3 == a && $4 == "true" && $5 == "valid") {print $1}')"
           if [ -n "$bad" ]; then
             echo "::error::protected paths changed by $(printf '%s\n' "$bad" | wc -l) commit(s) that are not approver-verified"

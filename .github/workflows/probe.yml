@@ -148,6 +148,14 @@ jobs:
           MP_OUTPUT_USD_PER_MTOK: ${{ vars.OUTPUT_USD_PER_MTOK }}
         run: bash scripts/start-model-proxy.sh
 
+      # Before the collection step: it copies every agent-readable file into
+      # /home/agent/dump, which would put copies of the pinned fixtures at unpinned
+      # paths. The dummy key and the proxy already exist here, so the audit still
+      # checks that the agent can't reach them, and no agent code has run yet.
+      - name: Credential audit as the agent user (T1, W11, W14)
+        if: env.MODE == 'probe-isolation'
+        run: bash scripts/run-as-agent.sh /home/agent/work bash scripts/probes/credential-audit.sh agent
+
       - name: Collect everything the agent can read (agent user)
         if: env.MODE == 'probe-isolation'
         env:
@@ -157,10 +165,6 @@ jobs:
       - name: Scan the dump for the key canary, three checks (root; no agent code)
         if: env.MODE == 'probe-isolation'
         run: sudo env CANARY_FILE=/var/lib/proofdummy/canary "$(command -v node)" scripts/probes/scan-dump.js /home/agent/dump
-
-      - name: Credential audit as the agent user (T1, W11, W14)
-        if: env.MODE == 'probe-isolation'
-        run: bash scripts/run-as-agent.sh /home/agent/work bash scripts/probes/credential-audit.sh agent
 
       - name: Network probe as the agent user (T3.1 to T3.8)
         if: env.MODE == 'probe-isolation'
