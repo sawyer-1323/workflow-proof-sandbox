@@ -1,0 +1,17 @@
+{
+  "spec": "spec/arith-spec.md",
+  "cases": [
+    { "id": 1, "op": "add", "a": 2, "b": 3, "expected": 5 },
+    { "id": 2, "op": "add", "a": -7, "b": 4, "expected": -3 },
+    { "id": 3, "op": "subtract", "a": 10, "b": 15, "expected": -5 },
+    { "id": 4, "op": "multiply", "a": -6, "b": 7, "expected": -42 },
+    { "id": 5, "op": "divideFloor", "a": 7, "b": 2, "expected": 3 },
+    { "id": 6, "op": "divideFloor", "a": -7, "b": 2, "expected": -4 },
+    { "id": 7, "op": "roundHalfEven", "a": 5, "b": 2, "expected": 2 },
+    { "id": 8, "op": "roundHalfEven", "a": 7, "b": 2, "expected": 4 },
+    { "id": 9, "op": "roundHalfEven", "a": -5, "b": 2, "expected": -2 },
+    { "id": 10, "op": "roundHalfEven", "a": 10, "b": 4, "expected": 2 },
+    { "id": 11, "op": "roundHalfEven", "a": 11, "b": 4, "expected": 3 },
+    { "id": 12, "op": "roundHalfEven", "a": 1, "b": 3, "expected": 0 }
+  ]
+}

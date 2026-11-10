@@ -1,0 +1,10 @@
+{
+  "name": "arith-proof",
+  "version": "0.0.0",
+  "private": true,
+  "description": "Synthetic integer arithmetic library used to test CI credential isolation.",
+  "license": "MIT",
+  "scripts": {
+    "test": "node --test"
+  }
+}

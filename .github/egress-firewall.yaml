@@ -1,0 +1,28 @@
+# OPTIONAL ALTERNATIVE, NOT USED BY DEFAULT.
+# The workflows enforce egress on standard ubuntu-24.04 runners with a local
+# allowlisting proxy and iptables owner-match rules (scripts/agent-sandbox.sh).
+# This file applies only if a job is moved to the egress-firewall runner label
+# (runs-on: ubuntu-24.04-firewall), whose availability is UNVERIFIED for this
+# account. Name each host in full (no '*') and say what uses it.
+mode: enforce
+allow:
+  # Claude API (review and implementation runs)
+  - api.anthropic.com
+  # GitHub REST and GraphQL API, and Git over HTTPS (runner steps only)
+  - api.github.com
+  - github.com
+  # npm registry (Claude Code CLI install, runner step)
+  - registry.npmjs.org
+  # Node.js and tool downloads from GitHub releases
+  - release-assets.githubusercontent.com
+  - objects.githubusercontent.com
+  # .NET SDK downloads (setup-dotnet)
+  - builds.dotnet.microsoft.com
+  - dotnetcli.azureedge.net
+  # PostgreSQL 17 and pgTAP packages, and their signing key
+  - apt.postgresql.org
+  - www.postgresql.org
+  # Ubuntu package mirrors
+  - azure.archive.ubuntu.com
+  - archive.ubuntu.com
+  - security.ubuntu.com

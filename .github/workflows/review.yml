@@ -1,0 +1,334 @@
+# Review of an untrusted pull request. PHASE R (read-only).
+#
+# pull_request_target runs THIS file from main, never the PR's copy.
+# Justification for pull_request_target (zizmor dangerous-triggers): the review
+# needs the proof model key (environment `review-agent`) and the artifact
+# decryption key (environment `review`). Both environments allow main only, so a
+# pull_request run on refs/pull/N/merge can never receive them.
+#
+# Stage gating (repository variable PROOF_STAGE, round 6):
+#   dummy  the proxy gets a synthetic dummy and runs OFFLINE (no upstream call);
+#          the real-key step is skipped and the secret need not exist.
+#   live   the real proof key goes to the proxy-start step only.
+# Run budget: deployments of `review-agent` inside the authorized window
+# (check-run-budget.js), not run_number, so renames and edits cannot reset it.
+# Jobs:
+# - golden-guard, policy-guard: base code compares PR files as data; they hold no secret.
+# - review-agent: the model key goes ONLY to the step that starts the model
+#   proxy (uid `modelproxy`). The agent runs as uid `agent` with a placeholder
+#   key, egress only to the model proxy, and no GitHub token. Its output is
+#   reduced to the schema, encrypted to the publish key, and uploaded (1 day).
+# - review-publish (live stage only): environment `review`. No App token in phase R. Decrypts and
+#   validates the artifact as data, checks the head, and publishes nothing:
+#   no comment, no check run, no summary, no artifact.
+# No PR event text is interpolated into a run step. No cache.
+# Action pins: full commit SHAs, verified 2026-11-06; check-pin-age.sh re-checks them.
+name: review
+
+on:
+  pull_request_target: # zizmor: ignore[dangerous-triggers] -- justified above
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions: {}
+
+concurrency:
+  group: review-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  golden-guard:
+    # Golden-test protection (T6). Base code compares PR files as data. No secrets.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the base (trusted)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the PR head as data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr-head
+          persist-credentials: false
+
+      - name: Compare protected baselines
+        run: bash scripts/golden-guard.sh "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/pr-head"
+
+  policy-guard:
+    # Protected-path guard (C-B6 merge block). Base code compares PR files as
+    # data. A protected-path change passes only if every PR commit is authored
+    # and committed by the approver's account and signed with the approver's
+    # own registered key (verification reason "valid"). Holds no secret.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Check out the base (trusted)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Check out the PR head as data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr-head
+          persist-credentials: false
+
+      - name: Compare protected paths; if changed, require approver-verified commits
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          APPROVER: ${{ vars.PROOF_APPROVER_LOGIN }}
+        run: |
+          set -uo pipefail
+          bash scripts/policy-guard.sh "$GITHUB_WORKSPACE" "$GITHUB_WORKSPACE/pr-head"; rc=$?
+          [ "$rc" -eq 0 ] && exit 0
+          [ "$rc" -eq 3 ] || exit 2
+          [[ "$APPROVER" =~ ^[A-Za-z0-9-]{1,39}$ ]] || { echo "::error::PROOF_APPROVER_LOGIN not set"; exit 2; }
+          # Committer must be the approver's own account with a valid signature by
+          # the approver's key. "web-flow" (GitHub's key) is NOT accepted: an App
+          # can create GitHub-signed API commits with any author email.
+          all="$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/commits?per_page=100" \
+            --jq '.[] | [.sha, (.author.login // ""), (.committer.login // ""), (.commit.verification.verified | tostring), (.commit.verification.reason // "")] | @tsv' 2>/dev/null)" \
+            || { echo "::error::cannot list the PR commits"; exit 2; }
+          n="$(printf '%s\n' "$all" | grep -c . || true)"
+          [ "$n" -ge 1 ] && [ "$n" -lt 250 ] || { echo "::error::commit list empty or at the API's 250-commit limit"; exit 2; }
+          bad="$(printf '%s\n' "$all" | awk -F'\t' -v a="$APPROVER" '!($2 == a && $3 == a && $4 == "true" && $5 == "valid") {print $1}')"
+          if [ -n "$bad" ]; then
+            echo "::error::protected paths changed by $(printf '%s\n' "$bad" | wc -l) commit(s) that are not approver-verified"
+            exit 1
+          fi
+          echo "policy-guard: protected-path change accepted: every commit is approver-verified"
+
+  review-agent:
+    # Same-repository PRs only: a fork PR also triggers pull_request_target (S1).
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.draft == false
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: review-agent # proof model key (used only by the model proxy)
+    # Shared with probe.yml: at most one model-using job runs at a time.
+    concurrency:
+      group: proof-model
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      pull-requests: read
+      deployments: read # the run budget counts this environment's deployments
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      AGENT_MODEL: ${{ vars.AGENT_MODEL }}
+      MP_MAX_TOKENS: "8192"
+      PROOF_STAGE: ${{ vars.PROOF_STAGE }}
+    steps:
+      - name: Validate the stage (dummy or live; anything else stops the job)
+        run: |
+          case "$PROOF_STAGE" in dummy|live) echo "stage $PROOF_STAGE" ;; *) echo "::error::PROOF_STAGE must be dummy or live"; exit 1 ;; esac
+
+      - name: Check out the base (trusted policy)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22" # pinned to an exact version after T4
+          package-manager-cache: false # P6, W8: no cache is saved or restored
+
+      - name: Persistent run budget, before any model use (base-branch code)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUDGET_ENVIRONMENT: review-agent
+          WINDOW_START: ${{ vars.PROOF_WINDOW_START }}
+          WINDOW_END: ${{ vars.PROOF_WINDOW_END }}
+          RUN_MAX: ${{ vars.REVIEW_RUN_MAX }}
+          MAX_ATTEMPTS: ${{ vars.MAX_ATTEMPTS }}
+        run: node scripts/check-run-budget.js
+
+      - name: Check out the PR head as data
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: pr-head
+          persist-credentials: false
+
+      - name: Install the agent tools (root-owned, before the sandbox)
+        run: |
+          bash scripts/install-tools.sh --no-postgres
+
+      - name: Build the sandbox (agent and modelproxy users, egress rules)
+        run: |
+          mv "$GITHUB_WORKSPACE/pr-head" "$RUNNER_TEMP/pr-head"
+          bash scripts/agent-sandbox.sh
+          bash scripts/stage-for-agent.sh "$GITHUB_WORKSPACE" /home/agent/work readonly
+          bash scripts/stage-for-agent.sh "$RUNNER_TEMP/pr-head" /home/agent/pr-head readonly --neutralize-symlinks
+
+      - name: Create the synthetic dummy key (dummy stage; no agent code)
+        if: vars.PROOF_STAGE == 'dummy'
+        env:
+          DUMMY_KEY_LENGTH: ${{ vars.DUMMY_KEY_LENGTH }}
+        run: bash scripts/make-dummy-key.sh
+
+      - name: Start the model proxy with the DUMMY key (dummy stage; offline)
+        if: vars.PROOF_STAGE == 'dummy'
+        env:
+          MP_USE_DUMMY: "1"
+          MP_MODELS: ${{ vars.AGENT_MODEL }}
+          MP_MAX_REQUESTS: "60"
+          MP_SPEND_CAP_USD: "0.70"
+          MP_MAX_INPUT_TOKENS: "60000"
+          MP_CACHE_WRITE_MULT: "2"
+          MP_INPUT_USD_PER_MTOK: ${{ vars.INPUT_USD_PER_MTOK }}
+          MP_OUTPUT_USD_PER_MTOK: ${{ vars.OUTPUT_USD_PER_MTOK }}
+        run: bash scripts/start-model-proxy.sh
+
+      - name: Start the model proxy (live stage; the only step that receives the model key)
+        if: vars.PROOF_STAGE == 'live'
+        env:
+          PROOF_STAGE: ${{ vars.PROOF_STAGE }}
+          MP_UPSTREAM_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MP_MODELS: ${{ vars.AGENT_MODEL }}
+          MP_MAX_REQUESTS: "60"
+          # Hard per-run cap (pre-request reservation in model-proxy.js).
+          # Largest reservation (60000 x 2 x 4 + 8192 x 20) / 1e6 = $0.6438 fits under $0.70.
+          MP_SPEND_CAP_USD: "0.70"
+          MP_MAX_INPUT_TOKENS: "60000"
+          MP_CACHE_WRITE_MULT: "2"
+          MP_INPUT_USD_PER_MTOK: ${{ vars.INPUT_USD_PER_MTOK }}
+          MP_OUTPUT_USD_PER_MTOK: ${{ vars.OUTPUT_USD_PER_MTOK }}
+        run: bash scripts/start-model-proxy.sh
+
+      - name: Collect everything the agent can read (agent user; S4 b, c; M1)
+        env:
+          DUMP_DIR: /home/agent/dump
+        run: bash scripts/run-as-agent.sh /home/agent/work node scripts/probes/agent-collect.js
+
+      - name: Scan the dump for the real key on its live path (root; no agent code)
+        run: sudo env CANARY_FILE=/var/lib/proofdummy/canary "$(command -v node)" scripts/probes/scan-dump.js /home/agent/dump
+
+      - name: Network probe as the agent user (T3.1 to T3.8)
+        run: bash scripts/run-as-agent.sh /home/agent/work bash scripts/probes/network-probe.sh
+
+      - name: Render the review prompt from the base template
+        run: |
+          sed -e "s|@PR_NUMBER@|${PR_NUMBER}|g" -e "s|@HEAD_SHA@|${HEAD_SHA}|g" \
+              -e "s|@PR_DIR@|/home/agent/pr-head|g" .github/claude/review-prompt.md \
+            | sudo tee /home/agent/task/review-prompt.md >/dev/null
+          sudo chown agent:agent /home/agent/task/review-prompt.md
+
+      - name: Review as the agent user (placeholder key, read-only tools, quiet)
+        # UNVERIFIED for Claude Code 2.1.309: flag names, settings keys, and the
+        # exact endpoints it calls through ANTHROPIC_BASE_URL.
+        # Dummy stage: the offline proxy refuses every model call, so the CLI is
+        # expected to fail; the run continues so packaging, encryption and the
+        # publish job are exercised with a "no result" review. The proxy log
+        # records which endpoints the CLI tried (the round-5 [U]).
+        run: |
+          rc=0
+          bash scripts/run-as-agent.sh --quiet claude --stdin /home/agent/task/review-prompt.md /home/agent/work \
+            claude -p --output-format json --max-turns 25 --model "$AGENT_MODEL" \
+              --settings .github/claude/review-settings.json \
+              --add-dir /home/agent/pr-head \
+              --allowedTools Read,Grep,Glob \
+              --disallowedTools Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch,Task || rc=$?
+          echo "review CLI exit code: $rc"
+          if [ "$rc" -ne 0 ] && [ "$PROOF_STAGE" != dummy ]; then exit "$rc"; fi
+
+      - name: Collect, reduce to the schema, validate (agent processes killed first)
+        run: |
+          set -euo pipefail
+          bash scripts/collect-agent-output.sh /home/agent/out "$RUNNER_TEMP/raw"
+          node scripts/package-output.js review "$RUNNER_TEMP/raw/claude.out" "$PR_NUMBER" "$HEAD_SHA" "$RUNNER_TEMP/review-out"
+          node scripts/validate-artifact.js review "$RUNNER_TEMP/review-out" --pr "$PR_NUMBER" --head "$HEAD_SHA"
+          rm -rf "$RUNNER_TEMP/raw"
+
+      # Dummy stage: no artifact key pair exists, so nothing is encrypted or
+      # uploaded and review-publish is skipped. The validated output is deleted.
+      - name: Discard the validated output (dummy stage)
+        if: vars.PROOF_STAGE == 'dummy'
+        run: |
+          rm -rf "$RUNNER_TEMP/review-out"
+          echo "dummy stage: output validated and discarded; nothing uploaded"
+
+      - name: Encrypt the validated output (live stage)
+        if: vars.PROOF_STAGE == 'live'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/enc"
+          node scripts/artifact-crypt.js encrypt .github/proof/artifact-public.pem "$RUNNER_TEMP/review-out" "$RUNNER_TEMP/enc/review-output.json"
+          rm -rf "$RUNNER_TEMP/review-out"
+
+      - name: Upload the encrypted review output (live stage)
+        if: vars.PROOF_STAGE == 'live'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: review-output
+          path: ${{ runner.temp }}/enc/review-output.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Show the model proxy metadata log (no prompt or response content)
+        if: always()
+        run: sudo cat /var/lib/modelproxy/metadata.log 2>/dev/null || echo "no proxy log"
+
+  review-publish:
+    needs: review-agent
+    # Live stage only: the dummy stage has no artifact key (nothing to decrypt).
+    if: github.event.pull_request.head.repo.full_name == github.repository && vars.PROOF_STAGE == 'live'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    environment: review # phase R: only the artifact decryption key
+    permissions:
+      contents: read
+      pull-requests: read
+    env:
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      EXPECTED_HEAD: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - name: Check out main for the trusted scripts (no PR code)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Download the encrypted agent output
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: review-output
+          path: ${{ runner.temp }}/enc
+
+      - name: Decrypt as data (counts only in the log)
+        env:
+          ARTIFACT_PRIVATE_KEY: ${{ secrets.ARTIFACT_PRIVATE_KEY }}
+        run: node scripts/artifact-crypt.js decrypt "$RUNNER_TEMP/enc/review-output.json" "$RUNNER_TEMP/in"
+
+      - name: Validate as data (fixed reasons and counts only in the log)
+        run: node scripts/validate-artifact.js review "$RUNNER_TEMP/in" --pr "$PR_NUMBER" --head "$EXPECTED_HEAD"
+
+      - name: Check the head has not moved
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          current="$(gh pr view "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --json headRefOid --jq .headRefOid)"
+          if [ "$current" = "$EXPECTED_HEAD" ]; then echo "head unchanged"; else echo "::warning::head moved; this review is stale"; fi
+
+      - name: Delete the decrypted output (never uploaded or logged)
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/in" "$RUNNER_TEMP/enc"

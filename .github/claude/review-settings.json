@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": ["Read", "Grep", "Glob"],
+    "deny": [
+      "Bash",
+      "Edit",
+      "Write",
+      "NotebookEdit",
+      "WebFetch",
+      "WebSearch",
+      "Task",
+      "Read(//proc/**)",
+      "Read(//sys/**)",
+      "Read(//etc/**)",
+      "Read(//home/runner/.claude/**)",
+      "Read(//home/runner/work/_temp/_runner_file_commands/**)",
+      "Grep(//proc/**)",
+      "Glob(//proc/**)"
+    ]
+  },
+  "disableAllHooks": true,
+  "enableAllProjectMcpServers": false
+}

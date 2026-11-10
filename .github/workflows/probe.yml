@@ -1,0 +1,392 @@
+# Probe workflow for the review job's environment (round 6, Path A). PHASE R.
+#
+# Replaces implement.yml. Under Path A, Cursor Cloud implements and Claude Code
+# only reviews and repairs, so the Claude-implementer modes are dropped. The
+# isolation, network, request-path, hostile-artifact, output-trace and token
+# probes move here; they test the same sandbox, model proxy and artifact path
+# that review.yml uses.
+#
+# Started only by the approver (workflow_dispatch on main; the triggering actor
+# must be vars.PROOF_APPROVER_LOGIN, so an App with Actions write, such as the
+# Cursor App, cannot start or re-run it).
+# Stage gating (repository variable PROOF_STAGE):
+#   dummy  no model key, no App private key, no artifact key anywhere. The proxy
+#          holds a synthetic dummy and runs OFFLINE (no upstream call). The
+#          publish job is skipped; S4 (d) and S5 are checked in the agent job
+#          after every agent process is killed; nothing is uploaded.
+#   live   the real proof key, only in mode probe-requests, only to the proxy;
+#          the App key and the artifact key in environment `probe`.
+# Jobs:
+# - probe-agent: environment `probe-agent` (main only). Runs agent-uid probes.
+# - probe-publish (live only): environment `probe` (main only). Runs no agent
+#   code. Mints the READ-ONLY review App token only for the token tests.
+#   Publishes nothing.
+# Modes:
+#   probe-isolation    M1, S4 (b, c), T1, T3.1 to T3.8, T4, W14. Dummy key, offline.
+#   probe-requests     M2 to M7 (dummy: offline proxy, local refusals; live: the
+#                      real key); live only, in the publish job: P5, S4 (a), T2,
+#                      P4 baseline, D1 to D11 baselines.
+#   malicious-artifact S4 (d).   s5-trace  S5.
+#   expiry-probe       P7/W12 (live only: needs the App key).
+# Action pins: full commit SHAs, verified 2026-11-06; check-pin-age.sh re-checks.
+name: probe
+
+on:
+  workflow_dispatch:
+    inputs:
+      task:
+        description: "Open pull request number used by the probes"
+        required: true
+        type: string
+      mode:
+        description: "probe-isolation | probe-requests | malicious-artifact | s5-trace | expiry-probe"
+        required: true
+        type: choice
+        options: [probe-isolation, probe-requests, malicious-artifact, s5-trace, expiry-probe]
+        default: probe-isolation
+
+permissions: {}
+
+concurrency:
+  group: probe
+  cancel-in-progress: false
+
+env:
+  TASK: ${{ inputs.task }}
+  MODE: ${{ inputs.mode }}
+  PROOF_STAGE: ${{ vars.PROOF_STAGE }}
+
+jobs:
+  probe-agent:
+    # The environment branch policy is the control; these are defense in depth.
+    if: github.ref == 'refs/heads/main' && github.triggering_actor == vars.PROOF_APPROVER_LOGIN
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    environment: probe-agent # live stage: the proof model key, used only by the proxy
+    # Shared with review.yml: at most one model-using job runs at a time.
+    concurrency:
+      group: proof-model
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      deployments: read # the run budget counts this environment's deployments
+    outputs:
+      base_sha: ${{ steps.base.outputs.sha }}
+    env:
+      AGENT_MODEL: ${{ vars.AGENT_MODEL }}
+      MP_MAX_TOKENS: "8192"
+    steps:
+      - name: Validate inputs and the stage
+        run: |
+          set -euo pipefail
+          [[ "$TASK" =~ ^[0-9]{1,7}$ ]] || { echo "::error::task must be a number"; exit 1; }
+          case "$PROOF_STAGE" in dummy|live) ;; *) echo "::error::PROOF_STAGE must be dummy or live"; exit 1 ;; esac
+          if [ "$MODE" = expiry-probe ] && [ "$PROOF_STAGE" != live ]; then
+            echo "::error::expiry-probe needs the live stage (App key)"; exit 1
+          fi
+          echo "stage $PROOF_STAGE, mode $MODE"
+
+      - name: Check out main (read-only token, not persisted)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22" # pinned to an exact version after T4
+          package-manager-cache: false # P6, W8: no cache is saved or restored
+
+      - name: Persistent run budget, before anything else runs (base-branch code)
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BUDGET_ENVIRONMENT: probe-agent
+          WINDOW_START: ${{ vars.PROOF_WINDOW_START }}
+          WINDOW_END: ${{ vars.PROOF_WINDOW_END }}
+          RUN_MAX: ${{ vars.PROBE_RUN_MAX }}
+          MAX_ATTEMPTS: ${{ vars.MAX_ATTEMPTS }}
+        run: node scripts/check-run-budget.js
+
+      - name: Record the commit the probes run from
+        id: base
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up .NET SDK (T4 toolchain, for the later repair proof)
+        if: env.MODE == 'probe-isolation'
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: "10.0.x" # pinned to an exact version after T4
+
+      - name: Install the agent tools (root-owned, before the sandbox)
+        if: env.MODE != 'expiry-probe'
+        run: |
+          if [ "$MODE" = probe-isolation ]; then bash scripts/install-tools.sh; else bash scripts/install-tools.sh --no-postgres; fi
+
+      - name: Build the sandbox (agent and modelproxy users, egress rules)
+        if: env.MODE != 'expiry-probe'
+        run: |
+          bash scripts/agent-sandbox.sh
+          bash scripts/stage-for-agent.sh "$GITHUB_WORKSPACE" /home/agent/work agent
+
+      # -------- probe-isolation: dummy key, offline proxy, collect, scan (M1, S4b) --------
+      - name: Create the synthetic dummy key (no agent code)
+        if: env.MODE == 'probe-isolation'
+        env:
+          DUMMY_KEY_LENGTH: ${{ vars.DUMMY_KEY_LENGTH }}
+        run: bash scripts/make-dummy-key.sh
+
+      - name: Start the model proxy with the DUMMY key (offline; real key never present)
+        if: env.MODE == 'probe-isolation'
+        env:
+          MP_USE_DUMMY: "1"
+          MP_MODELS: ${{ vars.AGENT_MODEL }}
+          MP_MAX_REQUESTS: "1"
+          MP_SPEND_CAP_USD: "0.01"
+          MP_MAX_INPUT_TOKENS: "4000"
+          MP_CACHE_WRITE_MULT: "2"
+          MP_INPUT_USD_PER_MTOK: ${{ vars.INPUT_USD_PER_MTOK }}
+          MP_OUTPUT_USD_PER_MTOK: ${{ vars.OUTPUT_USD_PER_MTOK }}
+        run: bash scripts/start-model-proxy.sh
+
+      - name: Collect everything the agent can read (agent user)
+        if: env.MODE == 'probe-isolation'
+        env:
+          DUMP_DIR: /home/agent/dump
+        run: bash scripts/run-as-agent.sh /home/agent/work node scripts/probes/agent-collect.js
+
+      - name: Scan the dump for the key canary, three checks (root; no agent code)
+        if: env.MODE == 'probe-isolation'
+        run: sudo env CANARY_FILE=/var/lib/proofdummy/canary "$(command -v node)" scripts/probes/scan-dump.js /home/agent/dump
+
+      - name: Credential audit as the agent user (T1, W11, W14)
+        if: env.MODE == 'probe-isolation'
+        run: bash scripts/run-as-agent.sh /home/agent/work bash scripts/probes/credential-audit.sh agent
+
+      - name: Network probe as the agent user (T3.1 to T3.8)
+        if: env.MODE == 'probe-isolation'
+        run: bash scripts/run-as-agent.sh /home/agent/work bash scripts/probes/network-probe.sh
+
+      - name: Model proxy egress, checked as uid modelproxy (T3.8, proxy side)
+        if: env.MODE == 'probe-isolation'
+        run: bash scripts/probes/modelproxy-egress-check.sh
+
+      - name: Toolchain check as the agent user (T4)
+        if: env.MODE == 'probe-isolation'
+        run: bash scripts/run-as-agent.sh /home/agent/work bash scripts/toolchain-check.sh
+
+      # -------- probe-requests: request path (M2 to M7) --------
+      # Dummy stage: synthetic dummy, offline proxy; local refusals are checked
+      # as in live and upstream rows expect 503. Live stage: the real key.
+      - name: Create the synthetic dummy key (dummy stage; no agent code)
+        if: env.MODE == 'probe-requests' && vars.PROOF_STAGE == 'dummy'
+        env:
+          DUMMY_KEY_LENGTH: ${{ vars.DUMMY_KEY_LENGTH }}
+        run: bash scripts/make-dummy-key.sh
+
+      - name: Start the model proxy with the DUMMY key (dummy stage; offline)
+        if: env.MODE == 'probe-requests' && vars.PROOF_STAGE == 'dummy'
+        env:
+          MP_USE_DUMMY: "1"
+          MP_MODELS: ${{ vars.AGENT_MODEL }}
+          MP_MAX_REQUESTS: "3"
+          MP_SPEND_CAP_USD: "0.20"
+          MP_MAX_INPUT_TOKENS: "4000"
+          MP_CACHE_WRITE_MULT: "2"
+          MP_INPUT_USD_PER_MTOK: ${{ vars.INPUT_USD_PER_MTOK }}
+          MP_OUTPUT_USD_PER_MTOK: ${{ vars.OUTPUT_USD_PER_MTOK }}
+        run: bash scripts/start-model-proxy.sh
+
+      - name: Start the model proxy with the REAL key (live stage, after isolation passed)
+        if: env.MODE == 'probe-requests' && vars.PROOF_STAGE == 'live'
+        env:
+          PROOF_STAGE: ${{ vars.PROOF_STAGE }}
+          MP_UPSTREAM_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          MP_MODELS: ${{ vars.AGENT_MODEL }}
+          MP_MAX_REQUESTS: "3"
+          # Hard per-run cap (pre-request reservation in model-proxy.js); input capped at 4000 tokens.
+          MP_SPEND_CAP_USD: "0.20"
+          MP_MAX_INPUT_TOKENS: "4000"
+          MP_CACHE_WRITE_MULT: "2"
+          MP_INPUT_USD_PER_MTOK: ${{ vars.INPUT_USD_PER_MTOK }}
+          MP_OUTPUT_USD_PER_MTOK: ${{ vars.OUTPUT_USD_PER_MTOK }}
+        run: bash scripts/start-model-proxy.sh
+
+      - name: Model proxy probe as the agent user (M2 to M7; stage-aware)
+        if: env.MODE == 'probe-requests'
+        run: bash scripts/run-as-agent.sh /home/agent/work bash scripts/probes/model-proxy-probe.sh
+
+      # -------- hostile artifact (S4d) and output trace (S5); no model --------
+      - name: Hostile output as the agent user (S4 d; quiet)
+        if: env.MODE == 'malicious-artifact'
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          sudo install -m 0644 scripts/probes/write-malicious-artifacts.js /home/agent/task/write-malicious-artifacts.js
+          bash scripts/run-as-agent.sh --quiet hostile /home/agent/work node /home/agent/task/write-malicious-artifacts.js \
+            /home/agent/out "$TASK" "$BASE_SHA" "$BASE_SHA"
+
+      - name: Plant the S5 canary where the agent can read it
+        if: env.MODE == 's5-trace'
+        env:
+          S5_CANARY: ${{ secrets.S5_CANARY }}
+        run: |
+          printf '%s\n' "$S5_CANARY" | sudo tee /home/agent/task/canary.txt >/dev/null
+          sudo chown agent:agent /home/agent/task/canary.txt
+          sudo chmod 0600 /home/agent/task/canary.txt
+
+      - name: Hostile output stub as the agent user (S5; quiet; no model)
+        if: env.MODE == 's5-trace'
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: |
+          sudo install -m 0644 scripts/probes/hostile-output-stub.js /home/agent/task/hostile-output-stub.js
+          bash scripts/run-as-agent.sh --quiet stub /home/agent/work node /home/agent/task/hostile-output-stub.js \
+            /home/agent/out "$TASK" "$BASE_SHA" "$BASE_SHA" /home/agent/task/canary.txt
+
+      - name: Collect the agent output (agent processes killed first)
+        if: env.MODE == 'malicious-artifact' || env.MODE == 's5-trace'
+        run: |
+          set -euo pipefail
+          bash scripts/collect-agent-output.sh /home/agent/out "$RUNNER_TEMP/raw"
+          out="$RUNNER_TEMP/probe-out"; mkdir -p "$out"
+          case "$MODE" in
+            malicious-artifact) cp -R "$RUNNER_TEMP/raw/cases" "$out/cases" ;;
+            s5-trace) cp -R "$RUNNER_TEMP/raw/s5" "$out/s5" ;;
+          esac
+          rm -rf "$RUNNER_TEMP/raw"
+
+      # Dummy stage: no artifact key and no publish job. The trusted checks run
+      # here, as the runner user, after every agent process is gone, on the
+      # collected copies only (never executed). The live stage checks them in
+      # probe-publish instead, after encryption, so the publish path is tested too.
+      - name: Hostile output is rejected and never executed (S4 d; dummy stage, agent job)
+        if: env.MODE == 'malicious-artifact' && vars.PROOF_STAGE == 'dummy'
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+        run: bash scripts/probes/check-malicious-cases.sh "$RUNNER_TEMP/probe-out/cases" "$TASK" "$BASE_SHA" "$BASE_SHA"
+
+      - name: Canaries are rejected in every detected encoding (S5; dummy stage, agent job)
+        if: env.MODE == 's5-trace' && vars.PROOF_STAGE == 'dummy'
+        env:
+          BASE_SHA: ${{ steps.base.outputs.sha }}
+          S5_CANARY: ${{ secrets.S5_CANARY }}
+        run: bash scripts/probes/check-s5-cases.sh "$RUNNER_TEMP/probe-out/s5" "$TASK" "$BASE_SHA" "$BASE_SHA"
+
+      - name: Discard the checked output (dummy stage)
+        if: (env.MODE == 'malicious-artifact' || env.MODE == 's5-trace') && vars.PROOF_STAGE == 'dummy'
+        run: |
+          rm -rf "$RUNNER_TEMP/probe-out"
+          echo "dummy stage: nothing uploaded"
+
+      - name: Encrypt the probe output (live stage)
+        if: (env.MODE == 'malicious-artifact' || env.MODE == 's5-trace') && vars.PROOF_STAGE == 'live'
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/enc"
+          node scripts/artifact-crypt.js encrypt .github/proof/artifact-public.pem "$RUNNER_TEMP/probe-out" "$RUNNER_TEMP/enc/probe-output.json"
+          rm -rf "$RUNNER_TEMP/probe-out"
+
+      - name: Upload the encrypted probe output (live stage)
+        if: (env.MODE == 'malicious-artifact' || env.MODE == 's5-trace') && vars.PROOF_STAGE == 'live'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: probe-output
+          path: ${{ runner.temp }}/enc/probe-output.json
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Show the model proxy metadata log (no prompt or response content)
+        if: always() && (env.MODE == 'probe-isolation' || env.MODE == 'probe-requests')
+        run: sudo cat /var/lib/modelproxy/metadata.log 2>/dev/null || echo "no proxy log"
+
+  probe-publish:
+    needs: probe-agent
+    # Live stage only: the dummy stage has no App key and no artifact key.
+    if: github.ref == 'refs/heads/main' && github.triggering_actor == vars.PROOF_APPROVER_LOGIN && vars.PROOF_STAGE == 'live'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 75
+    environment: probe # read-only review App key and artifact decryption key
+    permissions:
+      contents: read
+    env:
+      BASE_SHA: ${{ needs.probe-agent.outputs.base_sha }}
+    steps:
+      - name: Mint the read-only review App token (token tests only)
+        id: token
+        if: env.MODE == 'probe-requests' || env.MODE == 'expiry-probe'
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          client-id: ${{ vars.APP_CLIENT_ID }}
+          private-key: ${{ secrets.APP_PRIVATE_KEY }}
+          repositories: ${{ github.event.repository.name }}
+          permission-contents: read
+          permission-pull-requests: read
+
+      - name: Check out main for the trusted scripts (no agent code)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+          package-manager-cache: false
+
+      - name: Credential audit after minting (P5)
+        if: env.MODE == 'probe-requests'
+        run: bash scripts/probes/credential-audit.sh publish
+
+      - name: Static check, key secrets only where they belong (S4 a, M1 a)
+        if: env.MODE == 'probe-requests'
+        run: node scripts/check-key-references.js .github/workflows
+
+      - name: Token probe, phase R (T2, P4, D1 to D11)
+        if: env.MODE == 'probe-requests'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+          INSTALLATION_ID: ${{ steps.token.outputs.installation-id }}
+          PROBE_OTHER_REPO: ${{ vars.PROBE_OTHER_REPO }}
+          PROBE_PHASE: R
+        run: bash scripts/probes/token-probe.sh "$TASK"
+
+      - name: Token lifetime probe (P7, W12)
+        if: env.MODE == 'expiry-probe'
+        env:
+          GH_TOKEN: ${{ steps.token.outputs.token }}
+        run: |
+          set -uo pipefail
+          check() { curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $GH_TOKEN" \
+            https://api.github.com/installation/repositories; }
+          echo "fresh token: $(check) (expected 200)"
+          sleep 3660
+          code="$(check)"
+          echo "token after 61 minutes: $code (expected 401)"
+          [ "$code" = "401" ]
+
+      - name: Download the encrypted probe output
+        if: env.MODE == 'malicious-artifact' || env.MODE == 's5-trace'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: probe-output
+          path: ${{ runner.temp }}/enc
+
+      - name: Decrypt as data (counts only in the log)
+        if: env.MODE == 'malicious-artifact' || env.MODE == 's5-trace'
+        env:
+          ARTIFACT_PRIVATE_KEY: ${{ secrets.ARTIFACT_PRIVATE_KEY }}
+        run: node scripts/artifact-crypt.js decrypt "$RUNNER_TEMP/enc/probe-output.json" "$RUNNER_TEMP/in"
+
+      - name: Hostile output is rejected and never executed (S4 d)
+        if: env.MODE == 'malicious-artifact'
+        run: bash scripts/probes/check-malicious-cases.sh "$RUNNER_TEMP/in/cases" "$TASK" "$BASE_SHA" "$BASE_SHA"
+
+      - name: Canaries are rejected in every detected encoding (S5)
+        if: env.MODE == 's5-trace'
+        env:
+          S5_CANARY: ${{ secrets.S5_CANARY }}
+        run: bash scripts/probes/check-s5-cases.sh "$RUNNER_TEMP/in/s5" "$TASK" "$BASE_SHA" "$BASE_SHA"
+
+      - name: Delete the decrypted output (never uploaded or logged)
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/in" "$RUNNER_TEMP/enc"

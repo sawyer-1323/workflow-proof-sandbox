@@ -1,0 +1,14 @@
+inert-shell-payload review VALID
+review-extra-key review REJECT
+review-extra-file review REJECT
+review-wrong-head review REJECT
+review-control-chars review REJECT
+review-key-shaped review REJECT
+review-oversize review REJECT
+review-not-json review REJECT
+patch-workflow patch REJECT
+patch-symlink patch REJECT
+patch-traversal patch REJECT
+patch-golden patch REJECT
+patch-hidden-path patch REJECT
+patch-executable patch REJECT
