@@ -1,0 +1,129 @@
+# DS-3 secret-boundary fixture: pull_request and push routes (round 7). NOT part of main.
+# Placed on the test branch `ds3-leak` as `.github/workflows/ds3-leak.yml`, in a pull request
+# that is never merged (policy-guard fails it by design).
+#
+# Run ONLY while every environment holds nothing but its synthetic ENV_CANARY
+# (dummy stage; no model, App or artifact key exists). The fixture never prints
+# a canary: an environment job that reaches a step prints "DS3-RAN" with the
+# ref it ran on, and "DS3-CANARY reachable sha256-16=<prefix>" if the secret was
+# readable. scripts/probes/ds3-evidence.js turns the run into the DS-3 matrix.
+#
+# Expected for every environment job, with and without `deployment: false`:
+# refused by the `main`-only deployment branch policy before any step runs.
+# Any "DS3-RAN" or "DS3-CANARY reachable" line is a STOP (DUMMY-STAGE-PACKET).
+name: ds3-leak
+
+on:
+  pull_request:
+  push:
+    branches: [ds3-leak]
+
+permissions:
+  contents: read
+
+jobs:
+  context:
+    # Records the ref and event of this run (the environment jobs may never
+    # reach a step). Prints no secret.
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Event and ref of this run
+        run: |
+          echo "DS3-CONTEXT event=$GITHUB_EVENT_NAME ref=$GITHUB_REF ref_name=$GITHUB_REF_NAME head_ref=${GITHUB_HEAD_REF:-} base_ref=${GITHUB_BASE_REF:-} sha=$GITHUB_SHA"
+          echo "DS3-CONTEXT workflow_ref=$GITHUB_WORKFLOW_REF"
+
+  env-review-agent:
+    runs-on: ubuntu-24.04
+    environment: review-agent
+    steps:
+      - name: Report reach (never prints the value)
+        env:
+          C: ${{ secrets.ENV_CANARY }}
+        run: |
+          echo "DS3-RAN env=review-agent mode=default event=$GITHUB_EVENT_NAME ref=$GITHUB_REF"
+          if [ -n "$C" ]; then echo "DS3-CANARY reachable sha256-16=$(printf '%s' "$C" | sha256sum | cut -c1-16)"; else echo "DS3-CANARY empty"; fi
+
+  env-review-agent-nodeploy:
+    runs-on: ubuntu-24.04
+    environment:
+      name: review-agent
+      deployment: false
+    steps:
+      - name: Report reach (never prints the value)
+        env:
+          C: ${{ secrets.ENV_CANARY }}
+        run: |
+          echo "DS3-RAN env=review-agent mode=deployment-false event=$GITHUB_EVENT_NAME ref=$GITHUB_REF"
+          if [ -n "$C" ]; then echo "DS3-CANARY reachable sha256-16=$(printf '%s' "$C" | sha256sum | cut -c1-16)"; else echo "DS3-CANARY empty"; fi
+
+  env-probe-agent:
+    runs-on: ubuntu-24.04
+    environment: probe-agent
+    steps:
+      - name: Report reach (never prints the value)
+        env:
+          C: ${{ secrets.ENV_CANARY }}
+        run: |
+          echo "DS3-RAN env=probe-agent mode=default event=$GITHUB_EVENT_NAME ref=$GITHUB_REF"
+          if [ -n "$C" ]; then echo "DS3-CANARY reachable sha256-16=$(printf '%s' "$C" | sha256sum | cut -c1-16)"; else echo "DS3-CANARY empty"; fi
+
+  env-probe-agent-nodeploy:
+    runs-on: ubuntu-24.04
+    environment:
+      name: probe-agent
+      deployment: false
+    steps:
+      - name: Report reach (never prints the value)
+        env:
+          C: ${{ secrets.ENV_CANARY }}
+        run: |
+          echo "DS3-RAN env=probe-agent mode=deployment-false event=$GITHUB_EVENT_NAME ref=$GITHUB_REF"
+          if [ -n "$C" ]; then echo "DS3-CANARY reachable sha256-16=$(printf '%s' "$C" | sha256sum | cut -c1-16)"; else echo "DS3-CANARY empty"; fi
+
+  env-review:
+    runs-on: ubuntu-24.04
+    environment: review
+    steps:
+      - name: Report reach (never prints the value)
+        env:
+          C: ${{ secrets.ENV_CANARY }}
+        run: |
+          echo "DS3-RAN env=review mode=default event=$GITHUB_EVENT_NAME ref=$GITHUB_REF"
+          if [ -n "$C" ]; then echo "DS3-CANARY reachable sha256-16=$(printf '%s' "$C" | sha256sum | cut -c1-16)"; else echo "DS3-CANARY empty"; fi
+
+  env-review-nodeploy:
+    runs-on: ubuntu-24.04
+    environment:
+      name: review
+      deployment: false
+    steps:
+      - name: Report reach (never prints the value)
+        env:
+          C: ${{ secrets.ENV_CANARY }}
+        run: |
+          echo "DS3-RAN env=review mode=deployment-false event=$GITHUB_EVENT_NAME ref=$GITHUB_REF"
+          if [ -n "$C" ]; then echo "DS3-CANARY reachable sha256-16=$(printf '%s' "$C" | sha256sum | cut -c1-16)"; else echo "DS3-CANARY empty"; fi
+
+  env-probe:
+    runs-on: ubuntu-24.04
+    environment: probe
+    steps:
+      - name: Report reach (never prints the value)
+        env:
+          C: ${{ secrets.ENV_CANARY }}
+        run: |
+          echo "DS3-RAN env=probe mode=default event=$GITHUB_EVENT_NAME ref=$GITHUB_REF"
+          if [ -n "$C" ]; then echo "DS3-CANARY reachable sha256-16=$(printf '%s' "$C" | sha256sum | cut -c1-16)"; else echo "DS3-CANARY empty"; fi
+
+  env-probe-nodeploy:
+    runs-on: ubuntu-24.04
+    environment:
+      name: probe
+      deployment: false
+    steps:
+      - name: Report reach (never prints the value)
+        env:
+          C: ${{ secrets.ENV_CANARY }}
+        run: |
+          echo "DS3-RAN env=probe mode=deployment-false event=$GITHUB_EVENT_NAME ref=$GITHUB_REF"
+          if [ -n "$C" ]; then echo "DS3-CANARY reachable sha256-16=$(printf '%s' "$C" | sha256sum | cut -c1-16)"; else echo "DS3-CANARY empty"; fi
